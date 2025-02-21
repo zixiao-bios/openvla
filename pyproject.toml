@@ -53,9 +53,9 @@ dependencies = [
     "tensorflow_datasets==4.9.3",
     "tensorflow_graphics==2021.12.3",
     "dlimp @ git+https://github.com/moojink/dlimp_openvla",
-    packaging,
-    ninja,
-    bitsandbytes
+    "packaging",
+    "ninja",
+    "bitsandbytes"
 ]
 
 [project.optional-dependencies]
