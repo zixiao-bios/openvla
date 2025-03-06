@@ -3,7 +3,6 @@ from pathlib import Path
 from typing import Optional
 
 import torch
-import torch.distributed as dist
 import tqdm
 from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
 from torch.optim import AdamW
@@ -22,22 +21,29 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
 class FinetuneConfig:
-    # fmt: off
     vla_path: str = "/mnt/workspace/openvla-7b"                            # Path to OpenVLA model (on HuggingFace Hub)
 
-    # Directory Paths
-    data_root_dir: Path = Path("/mnt/workspace/Libero_RLDS")        # Path to Open-X dataset directory
-    dataset_name: str = "libero_spatial_no_noops"                                # Name of fine-tuning dataset (e.g., `droid_wipe`)
-    run_root_dir: Path = Path("runs")                               # Path to directory to store logs & checkpoints
-    adapter_tmp_dir: Path = Path("adapter-tmp")                     # Temporary directory for LoRA weights before fusing
+    # RLDS 数据集目录
+    data_root_dir: Path = Path("/mnt/workspace/Libero_RLDS")
+    dataset_name: str = "libero_spatial_no_noops"
+
+    # 结果保存目录
+    run_root_dir: Path = Path("runs")
 
     # Fine-tuning Parameters
-    batch_size: int = 1                                            # Fine-tuning batch size
+    batch_size: int = 1
+    learning_rate: float = 5e-4
+    use_lora: bool = True                                           # Whether to use LoRA fine-tuning
+    lora_rank: int = 32                                             # Rank of LoRA weight matrix
+    lora_dropout: float = 0.05                                      # Dropout applied to LoRA weights
+    use_quantization: bool = False                                  # Whether to 4-bit quantize VLA for LoRA fine-tuning
+                                                                    #   => CAUTION: Reduces memory but hurts performance
 
-    # 微调的时间步数（类似epoch）
-    max_steps: int = 200_000                                        # Max number of fine-tuning steps
-    save_steps: int = 5000                                          # Interval for checkpoint saving
-    learning_rate: float = 5e-4                                     # Fine-tuning learning rate
+    # 微调的最大时间步数（类似epoch）
+    max_steps: int = 200_000
+
+    # 保存检查点的间隔
+    save_steps: int = 1000
 
     # 梯度累积
     """
@@ -49,19 +55,12 @@ class FinetuneConfig:
 
     # 图像增强
     image_aug: bool = True                                          # Whether to train with image augmentations
-    shuffle_buffer_size: int = 100_000                              # Dataloader shuffle buffer size (can reduce if OOM)
-    save_latest_checkpoint_only: bool = True                        # Whether to save only one checkpoint per run and
-                                                                    #   continually overwrite the latest checkpoint
-                                                                    #   (If False, saves all checkpoints)
-    # LoRA Arguments
-    use_lora: bool = True                                           # Whether to use LoRA fine-tuning
-    lora_rank: int = 32                                             # Rank of LoRA weight matrix
-    lora_dropout: float = 0.0                                       # Dropout applied to LoRA weights
-    use_quantization: bool = False                                  # Whether to 4-bit quantize VLA for LoRA fine-tuning
-                                                                    #   => CAUTION: Reduces memory but hurts performance
 
-    # Tracking Parameters
-    run_id_note: Optional[str] = None                               # Extra note for logging, Weights & Biases
+    # 数据加载器用于打乱的缓冲区大小（如果内存不足可以减少）
+    shuffle_buffer_size: int = 100_000                              # Dataloader shuffle buffer size (can reduce if OOM)
+
+    # 加入运行 id 的额外注释
+    run_id_note: Optional[str] = None
 
 
 def finetune(cfg: FinetuneConfig) -> None:
@@ -84,7 +83,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         exp_id += "--image_aug"
 
     # Start =>> Build Directories
-    run_dir, adapter_dir = cfg.run_root_dir / exp_id, cfg.adapter_tmp_dir / exp_id
+    run_dir = cfg.run_root_dir / exp_id
     os.makedirs(run_dir, exist_ok=True)
 
     # 量化模型
@@ -131,13 +130,16 @@ def finetune(cfg: FinetuneConfig) -> None:
     # 将每个维度上的连续机器人动作，离散化为N个区间，并将其映射到最少使用的 token
     action_tokenizer = ActionTokenizer(processor.tokenizer)
 
-    # 加载微调数据集 =>> 使用遵循 Open X-Embodiment 的 RLDS 格式数据集。
+    # 加载微调数据集
+    # batch_transform 将 RLDS 格式数据集转换为模型输入形式
     batch_transform = RLDSBatchTransform(
         action_tokenizer,
         processor.tokenizer,
         image_transform=processor.image_processor.apply_transform,
         prompt_builder_fn=PurePromptBuilder,
     )
+
+    # 将本地的 RLDS 数据集文件，包装成一个 pytorch 的 Dataset 类
     vla_dataset = RLDSDataset(
         cfg.data_root_dir,
         cfg.dataset_name,
@@ -147,25 +149,24 @@ def finetune(cfg: FinetuneConfig) -> None:
         image_aug=cfg.image_aug,
     )
 
-    # 保存数据集统计，用于推理时的反量化操作
-    save_dataset_statistics(vla_dataset.dataset_statistics, run_dir)
-
     # 创建 DataLoader
+    # collator 对读取的每个 batch 数据做一些处理（填充、截断、mask 等）
     collator = PaddedCollatorForActionPrediction(
         processor.tokenizer.model_max_length, processor.tokenizer.pad_token_id, padding_side="right"
     )
     dataloader = DataLoader(
         vla_dataset,
         batch_size=cfg.batch_size,
-        sampler=None,
         collate_fn=collator,
-        num_workers=0,  # Important =>> Set to 0 if using RLDS; TFDS rolls its own parallelism!
     )
 
     # Train!
     with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
         vla.train()
         optimizer.zero_grad()
+
+        # 梯度累积的轮数（反向传播次数）
+        gradient_step_idx = 0
 
         for batch_idx, batch in enumerate(dataloader):
             # 自动混合精度
@@ -182,79 +183,49 @@ def finetune(cfg: FinetuneConfig) -> None:
             normalized_loss = loss / cfg.grad_accumulation_steps
             normalized_loss.backward()
 
-            # Compute Accuracy and L1 Loss for Logging
+            # output.logits 是语言模型输出的 token 分布的分数（未经过softmax的）
+            # 将图片特征对应的输出token排除
             action_logits = output.logits[:, vla.vision_backbone.featurizer.patch_embed.num_patches : -1]
+
+            # 选择分数最高的 token 作为预测结果
             action_preds = action_logits.argmax(dim=2)
+
+            # next token 预测任务，输出序列会右移一步，因此移除第一个 token，将目标序列与输出对齐
             action_gt = batch["labels"][:, 1:].to(action_preds.device)
+
+            # action_token_begin_idx 是词汇表中第一个用作表示 action 的 token id，因此大于 action_token_begin_idx 的都是 action token
+            # mask 表示哪些输出 token 属于 action，其他的 token 属于 language token，不用于计算准确率
             mask = action_gt > action_tokenizer.action_token_begin_idx
 
-            # Compute Accuracy
+            # 计算 action 的准确率
             correct_preds = (action_preds == action_gt) & mask
             action_accuracy = correct_preds.sum().float() / mask.sum().float()
 
-            # Compute L1 Loss on Predicted (Continuous) Actions
-            continuous_actions_pred = torch.tensor(
-                action_tokenizer.decode_token_ids_to_actions(action_preds[mask].cpu().numpy())
-            )
-            continuous_actions_gt = torch.tensor(
-                action_tokenizer.decode_token_ids_to_actions(action_gt[mask].cpu().numpy())
-            )
-            action_l1_loss = torch.nn.functional.l1_loss(continuous_actions_pred, continuous_actions_gt)
-
-            # Compute gradient step index
-            gradient_step_idx = batch_idx // cfg.grad_accumulation_steps
-
-            # Optimizer Step
+            # 到达梯度累积轮次后，再更新参数
             if (batch_idx + 1) % cfg.grad_accumulation_steps == 0:
                 optimizer.step()
                 optimizer.zero_grad()
                 progress.update()
+                gradient_step_idx += 1
 
-            # Save Model Checkpoint =>> by default, only keeps the latest checkpoint, continually overwriting it!
-            if gradient_step_idx > 0 and gradient_step_idx % cfg.save_steps == 0:
-                print(f"Saving Model Checkpoint for Step {gradient_step_idx}")
+                # 按指定间隔保存检查点
+                if gradient_step_idx % cfg.save_steps == 0:
+                    print(f"Saving Model Checkpoint for Step {gradient_step_idx}")
 
-                # If LoRA, we first save adapter weights, then merge into full model; otherwise, default save!
-                save_dir = adapter_dir if cfg.use_lora else run_dir
+                    # 创建检查点目录
+                    checkpoint_dir = Path(str(run_dir) + f"--{gradient_step_idx}_chkpt")
+                    os.makedirs(checkpoint_dir, exist_ok=True)
 
-                # Save Processor & Weights
-                processor.save_pretrained(run_dir)
-                vla.save_pretrained(save_dir)
+                    # 保存数据集统计，用于推理时的反量化操作
+                    save_dataset_statistics(vla_dataset.dataset_statistics, checkpoint_dir)
 
-                # Wait for processor and adapter weights to be saved by main process
-                dist.barrier()
+                    # 保存 lora 权重和 processor
+                    processor.save_pretrained(checkpoint_dir)
+                    vla.save_pretrained(checkpoint_dir)
 
-                # Merge LoRA weights into model backbone for faster inference
-                #   =>> Note that merging is slow and can be done post-hoc to speed up training
-                if cfg.use_lora:
-                    base_vla = AutoModelForVision2Seq.from_pretrained(
-                        cfg.vla_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=True
-                    )
-                    merged_vla = PeftModel.from_pretrained(base_vla, adapter_dir)
-                    merged_vla = merged_vla.merge_and_unload()
-                    if cfg.save_latest_checkpoint_only:
-                        # Overwrite latest checkpoint
-                        merged_vla.save_pretrained(run_dir)
+                    print(f"Saved Model Checkpoint for Step {gradient_step_idx} at: {checkpoint_dir}")
 
-                        print(f"Saved Model Checkpoint for Step {gradient_step_idx} at: {run_dir}")
-                    else:
-                        # Prepare to save checkpoint in new directory
-                        checkpoint_dir = Path(str(run_dir) + f"--{gradient_step_idx}_chkpt")
-                        os.makedirs(checkpoint_dir, exist_ok=True)
-
-                        # Save dataset statistics to new directory
-                        save_dataset_statistics(vla_dataset.dataset_statistics, checkpoint_dir)
-
-                        # Save processor and model weights to new directory
-                        processor.save_pretrained(checkpoint_dir)
-                        merged_vla.save_pretrained(checkpoint_dir)
-
-                        print(f"Saved Model Checkpoint for Step {gradient_step_idx} at: {checkpoint_dir}")
-
-                # Block on Main Process Checkpointing
-                dist.barrier()
-
-            # Stop training when max_steps is reached
+            # 到达最大步数时，停止训练
             if gradient_step_idx == cfg.max_steps:
                 print(f"Max step {cfg.max_steps} reached! Stopping training...")
                 break
